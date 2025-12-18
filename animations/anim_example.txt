@@ -1,3 +1,10 @@
+# LoopCodex Animation Example
+ping-pong = true
+author = william
+fps = 3
+char.0 = #FF0000
+char.- = #002fff
+
 {
 ---0---
 --0-0--
