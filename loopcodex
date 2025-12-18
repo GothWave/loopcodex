@@ -77,6 +77,7 @@ def load_animation(path):
         "author": "unknown",
         "fps": None,
         "colors": {},
+        "events": {},
     }
 
     frames = []
@@ -126,6 +127,22 @@ def load_animation(path):
                                 f"Warning: invalid color for character '{char}', using default color",
                                 file=sys.stderr
                             )
+                    elif key.startswith("event."):
+                        frame_str = key[6:]
+                        try:
+                            frame_index = int(frame_str) - 1
+                        except ValueError:
+                            print(f"Warning: invalid event frame '{frame_str}'",
+                                file=sys.stderr
+                            )
+                            continue
+                        event_str = value
+                        if ':' in event_str:
+                            event_type, arg = map(str.strip, event_str.split(':', 1))
+                        else:
+                            event_type = event_str.strip()
+                            arg = None
+                        config["events"].setdefault(frame_index, []).append((event_type, arg))
                     continue
 
                 # First frame marker ends header
@@ -176,14 +193,51 @@ def frame_sequence(frames, ping_pong=False):
 # ------------------ Core Class --------------------------
 
 class AnimationPlayer:
-    def __init__(self, frames, fps, ping_pong=False, color_map=None):
+    def __init__(self, frames, fps, ping_pong=False, color_map=None, events=None):
         self.frames = frames
         self.fps = fps
         self.ping_pong = ping_pong
         self.color_map = color_map or {}
+        self.events = events or {}
         self.running = True
+        self.event_handlers = {
+            'pause': self.handle_pause,
+            'fps': self.handle_fps,
+            'color_swap': self.handle_color_swap,
+        }
+
+    def handle_pause(self, arg):
+        if arg is not None:
+            try:
+                time.sleep(float(arg))
+            except ValueError:
+                pass
+
+    def handle_fps(self, arg):
+        if arg is not None:
+            try:
+                self.fps = float(arg)
+                if self.fps <= 0:
+                    self.fps = 10.0
+            except ValueError:
+                pass
+
+    def handle_color_swap(self, arg):
+        if arg and ':' in arg:
+            parts = arg.split(':')
+            if len(parts) == 2:
+                c1, c2 = map(str.strip, parts)
+                if c1 in self.color_map and c2 in self.color_map:
+                    self.color_map[c1], self.color_map[c2] = self.color_map[c2], self.color_map[c1]
+        else:
+            # Default: reverse color assignments
+            keys = list(self.color_map.keys())
+            values = list(self.color_map.values())[::-1]
+            self.color_map = dict(zip(keys, values))
 
     def run(self):
+        frame_index = 0
+        direction = 1
         delay = 1.0 / self.fps
         sequence = frame_sequence(self.frames, self.ping_pong)
 
@@ -193,6 +247,59 @@ class AnimationPlayer:
 
         try:
             while self.running:
+                frame_start = time.monotonic()
+
+                # Trigger events before rendering
+                if frame_index in self.events:
+                    for event_type, arg in self.events[frame_index]:
+                        handler = self.event_handlers.get(event_type)
+                        if handler:
+                            handler(arg)
+
+                # Render the frame
+                sys.stdout.write(CURSOR_HOME)
+                sys.stdout.write(CLEAR_FROM_CURSOR)
+                sys.stdout.write(render_frame(self.frames[frame_index], self.color_map))
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+
+                # Update frame index
+                next_index = frame_index + direction
+                if self.ping_pong:
+                    if (direction == 1 and frame_index == len(self.frames) - 1) or \
+                       (direction == -1 and frame_index == 0):
+                        direction = -direction
+                    next_index = frame_index + direction
+                else:
+                    if next_index >= len(self.frames):
+                        next_index = 0
+
+                frame_index = next_index
+
+                # Timing and key check
+                elapsed = time.monotonic() - frame_start
+                delay = 1.0 / self.fps
+                remaining = delay - elapsed
+
+                if remaining > 0:
+                    key = read_key_with_timeout(remaining)
+                    if key and key.lower() == "q":
+                        self.running = False
+                else:
+                    if key_pressed():
+                        key = read_key()
+                        if key.lower() == "q":
+                            self.running = False
+        finally:
+            restore_terminal(old_term)
+            sys.stdout.write(SHOW_CURSOR)
+            sys.stdout.write(CURSOR_HOME)
+            sys.stdout.write(CLEAR_FROM_CURSOR)
+            sys.stdout.flush()
+
+
+
+'''
                 for frame in sequence:
                     if not self.running:
                         break
@@ -225,7 +332,7 @@ class AnimationPlayer:
             sys.stdout.write(CURSOR_HOME)
             sys.stdout.write(CLEAR_FROM_CURSOR)
             sys.stdout.flush()
-
+'''
 # ------------------ Signal -----------------------------
 def handle_sigint(player, signum, frame):
     player.running = False
@@ -254,7 +361,8 @@ def main():
         frames=frames,
         fps=fps,
         ping_pong=config["ping-pong"],
-        color_map=config["colors"]
+        color_map=config["colors"],
+        events=config["events"]
     )
 
     signal.signal(
