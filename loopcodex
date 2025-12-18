@@ -10,7 +10,6 @@ import select
 import signal
 from functools import partial
 
-
 CURSOR_HOME = "\033[H"
 CLEAR_FROM_CURSOR = "\033[J"
 HIDE_CURSOR = "\033[?25l"
