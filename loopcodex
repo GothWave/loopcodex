@@ -1,0 +1,267 @@
+#!/usr/bin/env python3
+
+import argparse
+import os
+import time
+import sys
+import termios
+import tty
+import select
+import signal
+from functools import partial
+
+CURSOR_HOME = "\033[H"
+CLEAR_FROM_CURSOR = "\033[J"
+HIDE_CURSOR = "\033[?25l"
+SHOW_CURSOR = "\033[?25h"
+
+# ----------------- Utility / Terminal -------------------
+def hex_to_rgb(hex_color):
+    hex_color = hex_color.lstrip("#")
+    return tuple(int(hex_color[i:i+2],16) for i in (0, 2, 4))
+
+def ansi_color(rgb):
+    r, g, b = rgb
+    return f"\033[38;2;{r};{g};{b}m"
+
+def enable_raw_mode():
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    tty.setcbreak(fd)
+    return old_settings
+
+def restore_terminal(settings):
+    termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, settings)
+
+def key_pressed():
+    return select.select([sys.stdin], [], [], 0)[0]
+
+def read_key():
+    return sys.stdin.read(1)
+
+def read_key_with_timeout(timeout):
+    r, _, _ = select.select([sys.stdin], [], [], timeout)
+    if r:
+        return sys.stdin.read(1)
+    return None
+
+# -------------------- Parsing --------------------------
+def parse_bool(value):
+    return value.lower() in ("1", "true", "yes", "on")
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="LoopCodex - ASCII animation player"
+    )
+    parser.add_argument(
+        "--anim",
+        required=True,
+        help="Animation file name (without extension)"
+    )
+    parser.add_argument(
+        "--fps",
+        type=float,
+        default=None,
+        help="Frames per second"
+    )
+    return parser.parse_args()
+
+def load_animation(path):
+    if not os.path.exists(path):
+        print(f"Animation file not found: {path}")
+        sys.exit(1)
+
+    config = {
+        "ping-pong": False,
+        "author": "unknown",
+        "fps": None,
+        "colors": {},
+    }
+
+    frames = []
+    current_frame = []
+    inside_frame = False
+    reading_header = True
+
+    with open(path, "r") as f:
+        for raw_line in f:
+            line = raw_line.rstrip("\n")
+
+            # Skip comments
+            if line.strip().startswith("#"):
+                continue
+
+            # Header parsing
+            if reading_header:
+                if line.strip().startswith("{"):
+                    reading_header = False
+
+                if "=" in line:
+                    key, value = map(str.strip, line.split("=", 1))
+                    key = key.lower()
+
+                    if key == "ping-pong":
+                        config["ping-pong"] = parse_bool(value)
+                    elif key == "author":
+                        config["author"] = value
+                    elif key == "fps":
+                        try:
+                            config["fps"] = float(value)
+                        except ValueError:
+                            print(
+                                "Warning: invalid fps value in animation file, using default value",
+                                file=sys.stderr
+                            )
+                            config["fps"] = None
+                    elif line.startswith("char.") and len(line) >= 9:
+                        char = line[5]
+                        value = line[8:].strip()
+                        
+                        try:
+                            rgb = hex_to_rgb(value)
+                            config["colors"][char] = ansi_color(rgb)
+                        except Exception:
+                            print(
+                                f"Warning: invalid color for character '{char}', using default color",
+                                file=sys.stderr
+                            )
+                    continue
+
+                # First frame marker ends header
+                if line.strip().startswith("{"):
+                    reading_header = False
+
+            # Frame parsing
+            if line.strip().startswith("{"):
+                inside_frame = True
+                current_frame = []
+                continue
+
+            if line.strip().endswith("}"):
+                inside_frame = False
+                frames.append(current_frame.copy())
+                continue
+
+            if inside_frame:
+                current_frame.append(line)
+
+    if not frames:
+        print("No frames detected in animation file.")
+        sys.exit(1)
+
+    return config, frames
+
+# -------------------- Rendering --------------------------
+def render_frame(frame, color_map):
+    reset = "\033[0m"
+    rendered_lines = []
+
+    for line in frame:
+        rendered = []
+        for ch in line:
+            if ch in color_map:
+                rendered.append(color_map[ch] + ch + reset)
+            else:
+                rendered.append(ch)
+        rendered_lines.append("".join(rendered))
+    return "\n".join(rendered_lines)
+
+def frame_sequence(frames, ping_pong=False):
+    if not ping_pong or len(frames) < 2:
+        return frames
+
+    return frames + frames[-2:0:-1]
+
+# ------------------ Core Class --------------------------
+
+class AnimationPlayer:
+    def __init__(self, frames, fps, ping_pong=False, color_map=None):
+        self.frames = frames
+        self.fps = fps
+        self.ping_pong = ping_pong
+        self.color_map = color_map or {}
+        self.running = True
+
+    def run(self):
+        delay = 1.0 / self.fps
+        sequence = frame_sequence(self.frames, self.ping_pong)
+
+        old_term = enable_raw_mode()
+        sys.stdout.write(HIDE_CURSOR)
+        sys.stdout.flush()
+
+        try:
+            while self.running:
+                for frame in sequence:
+                    if not self.running:
+                        break
+
+                    frame_start = time.monotonic()
+
+                    sys.stdout.write(CURSOR_HOME)
+                    sys.stdout.write(CLEAR_FROM_CURSOR)
+                    sys.stdout.write(render_frame(frame, self.color_map))
+                    sys.stdout.write("\n")
+                    sys.stdout.flush()
+
+                    elapsed = time.monotonic() - frame_start
+                    remaining = delay - elapsed
+
+                    if remaining > 0:
+                        key = read_key_with_timeout(remaining)
+                        if key and key.lower() == "q":
+                            self.running = False
+                            break
+                    else:
+                        if key_pressed():
+                            key = read_key()
+                            if key.lower() == "q":
+                                self.running = False
+                                break
+        finally:
+            restore_terminal(old_term)
+            sys.stdout.write(SHOW_CURSOR)
+            sys.stdout.write(CURSOR_HOME)
+            sys.stdout.write(CLEAR_FROM_CURSOR)
+            sys.stdout.flush()
+
+# ------------------ Signal -----------------------------
+def handle_sigint(player, signum, frame):
+    player.running = False
+
+# ------------------- Entry Point -------------------------
+def main():
+    args = parse_args()
+    anim_path = os.path.join("animations", f"{args.anim}.txt")
+    config, frames = load_animation(anim_path)
+
+    if args.fps is not None:
+        fps = args.fps
+    elif config["fps"] is not None:
+        fps = config["fps"]
+    else:
+        fps = 10.0
+
+    if fps <= 0:
+        print(
+            "Warning: invalid fps value, using default value",
+            file=sys.stderr
+        )
+        fps = 10.0
+    
+    player = AnimationPlayer(
+        frames=frames,
+        fps=fps,
+        ping_pong=config["ping-pong"],
+        color_map=config["colors"]
+    )
+
+    signal.signal(
+        signal.SIGINT,
+        partial(handle_sigint, player)
+    )
+
+    player.run()
+
+if __name__ == "__main__":
+    main()
